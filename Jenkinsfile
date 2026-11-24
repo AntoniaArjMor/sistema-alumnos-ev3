@@ -18,6 +18,8 @@ pipeline {
 
     environment {
         PIP_DISABLE_PIP_VERSION_CHECK = '1'
+        APP_SECRET_KEY = credentials('app-secret-key')
+        ADMIN_CLAVE_HASH = credentials('admin-clave-hash')
     }
 
     stages {
