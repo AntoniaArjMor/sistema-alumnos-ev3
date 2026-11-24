@@ -202,7 +202,10 @@ def buscar_alumnos():
     @return JSON con los alumnos encontrados.
     """
     nombre = request.args.get("nombre", "")
-    consulta = f"SELECT * FROM alumnos WHERE nombre LIKE '%{nombre}%'"
+    filas = conectar().execute(
+        consulta,
+        (f"%{nombre}%",)
+    ).fetchall()
     try:
         filas = conectar().execute(consulta).fetchall()
     except sqlite3.Error as error:
