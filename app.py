@@ -5,44 +5,22 @@
 Además de las rutas de negocio, la app publica métricas para Prometheus en /metrics.
 Las métricas de seguridad (logins fallidos y peticiones sospechosas) se ven en Grafana.
 """
-import secrets
+import hashlib
 import os
 import re
 import sqlite3
 import time
-from collections import deque
-from threading import Lock
 
-from flask import Flask, Response, g, jsonify, render_template_string, request, session
+from flask import Flask, Response, g, jsonify, render_template_string, request
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
-from werkzeug.security import check_password_hash
 
 app = Flask(__name__)
 
-## Secretos externos: obligatorios para iniciar la aplicación.
-SECRET_KEY = os.environ.get("APP_SECRET_KEY")
-ADMIN_USUARIO = os.environ.get("ADMIN_USUARIO", "admin")
-ADMIN_CLAVE_HASH = os.environ.get("ADMIN_CLAVE_HASH")
-
-if not SECRET_KEY or not ADMIN_CLAVE_HASH:
-    raise RuntimeError(
-        "Configura APP_SECRET_KEY y ADMIN_CLAVE_HASH antes de iniciar la aplicación"
-    )
-
-app.config.update(
-    SECRET_KEY=SECRET_KEY,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get("APP_COOKIE_SECURE", "0") == "1",
-    MAX_CONTENT_LENGTH=16 * 1024,
-)
-
-## Limitación de intentos por IP (un proceso Gunicorn en este laboratorio).
-MAX_INTENTOS = 5
-VENTANA_SEGUNDOS = 60
-MAX_IPS = 4096
-INTENTOS_LOGIN = {}
-LOGIN_LOCK = Lock()
+## Clave de la aplicación y credenciales del administrador.
+SECRET_KEY = "SecureDev-2024-clave-super-secreta"
+ADMIN_USUARIO = "admin"
+ADMIN_CLAVE_MD5 = "21232f297a57a5a743894a0e4a801fc3"
+app.config["SECRET_KEY"] = SECRET_KEY
 
 ## Versión desplegada: la inyecta el pipeline (1.0.<build>+<commit>). Sirve para la trazabilidad.
 VERSION = os.environ.get("APP_VERSION", "dev")
@@ -89,7 +67,6 @@ PORTADA = """<!doctype html>
 </form>
 <h2>Acceso administrador</h2>
 <form action="/login" method="post">
-  <input type="hidden" id="csrf_token" name="csrf_token" value="{{ csrf_token }}">
   <input name="usuario" value="admin"> <input name="clave" type="password" value="">
   <button type="submit">Entrar</button>
 </form>
@@ -155,14 +132,6 @@ def despues_de_la_peticion(respuesta):
     if endpoint != "/metrics":
         HTTP_PETICIONES.labels(request.method, endpoint, str(respuesta.status_code)).inc()
         HTTP_LATENCIA.labels(endpoint).observe(time.perf_counter() - g.get("inicio", time.perf_counter()))
-    respuesta.headers["X-Content-Type-Options"] = "nosniff"
-    respuesta.headers["X-Frame-Options"] = "DENY"
-    respuesta.headers["Referrer-Policy"] = "no-referrer"
-    respuesta.headers["Content-Security-Policy"] = (
-        "default-src 'self'; object-src 'none'; frame-ancestors 'none'; "
-        "base-uri 'self'; form-action 'self'"
-    )
-    respuesta.headers["Cache-Control"] = "no-store"
     return respuesta
 
 
@@ -172,21 +141,17 @@ def portada():
     @brief Portada HTML con enlaces y formularios del sistema.
     @return Página HTML.
     """
-    if "csrf_token" not in session:
-        session["csrf_token"] = secrets.token_hex(32)
-    return render_template_string(
-        PORTADA, version=VERSION, csrf_token=session["csrf_token"]
-    )
+    return render_template_string(PORTADA, version=VERSION)
 
 
 @app.route("/hello")
 def hello():
-    """!
-    @brief Saluda al usuario cuyo nombre llega en el parámetro de URL «name».
-    @return Página HTML con el saludo.
-    """
     name = request.args.get("name", "visitante")
-    return render_template_string("<h1>Hola, {{ name }}!</h1>", name=name)
+
+    return render_template_string(
+        "<h1>Hola, {{ name }}!</h1>",
+        name=name
+    )
 
 
 @app.route("/health")
@@ -229,7 +194,6 @@ def obtener_alumno(alumno_id):
         return jsonify({"error": "Alumno no encontrado"}), 404
     return jsonify(dict(fila))
 
-
 @app.route("/alumnos/buscar")
 def buscar_alumnos():
     """!
@@ -237,36 +201,23 @@ def buscar_alumnos():
     @return JSON con los alumnos encontrados.
     """
     nombre = request.args.get("nombre", "")
+
     consulta = "SELECT * FROM alumnos WHERE nombre LIKE ?"
+
     try:
-        filas = conectar().execute(consulta, (f"%{nombre}%",)).fetchall()
+        filas = conectar().execute(
+            consulta,
+            (f"%{nombre}%",)
+        ).fetchall()
+
     except sqlite3.Error:
         app.logger.exception("Error al buscar alumnos")
-        return jsonify({"error": "Error interno del servidor"}), 500
+        return jsonify({
+            "error": "Error interno del servidor"
+        }), 500
+
     return jsonify([dict(f) for f in filas])
 
-
-def permitir_intento(ip):
-    """!
-    @brief Reserva un intento de login dentro de la ventana por IP.
-    @param ip Dirección de origen de la petición.
-    @return True si el intento se permite.
-    """
-    with LOGIN_LOCK:
-        ahora = time.monotonic()
-        for origen, intentos in list(INTENTOS_LOGIN.items()):
-            while intentos and ahora - intentos[0] >= VENTANA_SEGUNDOS:
-                intentos.popleft()
-            if not intentos:
-                del INTENTOS_LOGIN[origen]
-
-        if ip not in INTENTOS_LOGIN and len(INTENTOS_LOGIN) >= MAX_IPS:
-            return False
-        intentos = INTENTOS_LOGIN.setdefault(ip, deque())
-        if len(intentos) >= MAX_INTENTOS:
-            return False
-        intentos.append(ahora)
-        return True
 
 
 @app.route("/login", methods=["POST"])
@@ -275,33 +226,13 @@ def login():
     @brief Valida las credenciales del administrador enviadas por formulario.
     @return JSON con el resultado; 401 si las credenciales no son válidas.
     """
-    token_enviado = request.form.get("csrf_token", "")
-    token_sesion = session.get("csrf_token", "")
-    if not token_sesion or not secrets.compare_digest(
-        token_enviado.encode("utf-8"), token_sesion.encode("utf-8")
-    ):
-        app.logger.warning("Token CSRF inválido desde %s", request.remote_addr)
-        return jsonify({"error": "Token CSRF inválido"}), 403
-
-    ip = request.remote_addr or "desconocida"
-    if not permitir_intento(ip):
-        app.logger.warning("Login limitado desde %s", ip)
-        respuesta = jsonify({"error": "Demasiados intentos. Intente más tarde."})
-        respuesta.headers["Retry-After"] = str(VENTANA_SEGUNDOS)
-        return respuesta, 429
-
     usuario = request.form.get("usuario", "")
     clave = request.form.get("clave", "")
-    clave_valida = check_password_hash(ADMIN_CLAVE_HASH, clave)
-    if usuario == ADMIN_USUARIO and clave_valida:
-        with LOGIN_LOCK:
-            INTENTOS_LOGIN.pop(ip, None)
-        session.pop("csrf_token", None)
+    if usuario == ADMIN_USUARIO and hashlib.md5(clave.encode()).hexdigest() == ADMIN_CLAVE_MD5:
         LOGIN_EXITOSOS.inc()
         return jsonify({"mensaje": "Bienvenido, administrador"})
-
     LOGIN_FALLIDOS.inc()
-    app.logger.warning("Login fallido desde %s", ip)
+    app.logger.warning("Login fallido para el usuario '%s' desde %s", usuario, request.remote_addr)
     return jsonify({"error": "Credenciales inválidas"}), 401
 
 
@@ -317,4 +248,4 @@ def metrics():
 iniciar_db()
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=True)
