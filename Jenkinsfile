@@ -49,12 +49,76 @@ pipeline {
             }
         }
 
-        // >>> [SEGURIDAD]: aquí van las etapas "Security Review (SAST)" y "Dependency Management"
+        stage('Security Review (SAST)') {
+    steps {
+        script {
+            sh 'bandit -q app.py -f json -o reports/bandit.json --exit-zero'
 
-        // >>> [ZAP]: aquí van las etapas "Deploy Staging" y "DAST - OWASP ZAP"
+            def resultado = sh(
+                script: 'bandit -ll app.py -o reports/bandit.txt',
+                returnStatus: true
+            )
+
+            sh 'cat reports/bandit.txt'
+
+            if (resultado != 0) {
+                unstable('Bandit detecto hallazgos o errores')
+            }
+        }
+    }
+}
+
+        stage('Dependency Management') {
+            steps {
+                script {
+                    def resultado = sh(
+                        script: 'pip-audit -r requirements.txt -r requirements-dev.txt -o reports/pip-audit.txt',
+                        returnStatus: true
+                    )
+
+                    def resultadoJson = sh(
+                        script: 'pip-audit -r requirements.txt -r requirements-dev.txt -f json -o reports/pip-audit.json',
+                        returnStatus: true
+                    )
+
+                    sh 'cat reports/pip-audit.txt'
+
+                    if (resultado != 0 || resultadoJson != 0) {
+                        unstable('Dependencias vulnerables o error de auditoria')
+                    }
+                }
+            }
+        }
+
+            stage('Deploy Staging') {
+        steps {
+            sh 'bash scripts/deploy.sh staging 5001'
+        }
+    }
+
+        stage('DAST - OWASP ZAP') {
+            steps {
+                script {
+                    def resultado = sh(
+                        script: 'python3 scripts/zap_scan.py http://jenkins:5001',
+                        returnStatus: true
+                    )
+
+                    if (resultado == 2) {
+                        unstable('ZAP encontro alertas High o Medium')
+                    } else if (resultado != 0) {
+                        error('Error durante la ejecucion de OWASP ZAP')
+                    }
+                }
+            }
+        }
 
         stage('Deploy Producción') {
-            // >>> [GATE]: aquí va la condición "when" que protege producción
+                        when {
+                expression {
+                    currentBuild.currentResult == 'SUCCESS'
+                }
+            }
             steps {
                 sh 'bash scripts/deploy.sh produccion 5000'
                 script { env.PRODUCCION = env.APP_VERSION }
