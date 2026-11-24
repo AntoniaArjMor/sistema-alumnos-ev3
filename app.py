@@ -5,9 +5,9 @@
 Además de las rutas de negocio, la app publica métricas para Prometheus en /metrics.
 Las métricas de seguridad (logins fallidos y peticiones sospechosas) se ven en Grafana.
 """
+import secrets
 import os
 import re
-import secrets
 import sqlite3
 import time
 from collections import deque
@@ -19,18 +19,32 @@ from werkzeug.security import check_password_hash
 
 app = Flask(__name__)
 
-## Clave de aplicación y credenciales del administrador, obtenidas del entorno.
+## Secretos externos: obligatorios para iniciar la aplicación.
 SECRET_KEY = os.environ.get("APP_SECRET_KEY")
 ADMIN_USUARIO = os.environ.get("ADMIN_USUARIO", "admin")
 ADMIN_CLAVE_HASH = os.environ.get("ADMIN_CLAVE_HASH")
-if not SECRET_KEY or not ADMIN_CLAVE_HASH:
-    raise RuntimeError("Configura APP_SECRET_KEY y ADMIN_CLAVE_HASH antes de iniciar la aplicación")
-app.config["SECRET_KEY"] = SECRET_KEY
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
 
-## Versión desplegada: la inyecta el pipeline (1.0.<build>+<commit>).
+if not SECRET_KEY or not ADMIN_CLAVE_HASH:
+    raise RuntimeError(
+        "Configura APP_SECRET_KEY y ADMIN_CLAVE_HASH antes de iniciar la aplicación"
+    )
+
+app.config.update(
+    SECRET_KEY=SECRET_KEY,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("APP_COOKIE_SECURE", "0") == "1",
+    MAX_CONTENT_LENGTH=16 * 1024,
+)
+
+## Limitación de intentos por IP (un proceso Gunicorn en este laboratorio).
+MAX_INTENTOS = 5
+VENTANA_SEGUNDOS = 60
+MAX_IPS = 4096
+INTENTOS_LOGIN = {}
+LOGIN_LOCK = Lock()
+
+## Versión desplegada: la inyecta el pipeline (1.0.<build>+<commit>). Sirve para la trazabilidad.
 VERSION = os.environ.get("APP_VERSION", "dev")
 ## Archivo SQLite con los alumnos (cada entorno usa el suyo).
 DB_PATH = os.environ.get("DB_PATH", "alumnos.db")
@@ -58,12 +72,6 @@ PATRONES_ATAQUE = {
     "path_traversal": re.compile(r"\.\./|\.\.\\|%2e%2e", re.I),
 }
 
-## Límite de intentos de autenticación por IP en una ventana móvil.
-MAX_INTENTOS = 5
-VENTANA_SEGUNDOS = 60
-INTENTOS_LOGIN = {}
-BLOQUEO_INTENTOS = Lock()
-
 PORTADA = """<!doctype html>
 <html lang="es">
 <head><meta charset="utf-8"><title>Sistema Alumnos</title></head>
@@ -81,8 +89,8 @@ PORTADA = """<!doctype html>
 </form>
 <h2>Acceso administrador</h2>
 <form action="/login" method="post">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-  <input name="usuario" value="{{ admin_usuario }}"> <input name="clave" type="password" value="">
+  <input type="hidden" id="csrf_token" name="csrf_token" value="{{ csrf_token }}">
+  <input name="usuario" value="admin"> <input name="clave" type="password" value="">
   <button type="submit">Entrar</button>
 </form>
 </body>
@@ -94,3 +102,219 @@ def conectar():
     @brief Abre (una vez por petición) la conexión a la base de datos SQLite.
     @return Conexión sqlite3 con filas accesibles por nombre de columna.
     """
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+@app.teardown_appcontext
+def cerrar_db(_error):
+    """!
+    @brief Cierra la conexión a la base de datos al terminar cada petición.
+    @param _error Excepción de la petición (si la hubo); no se usa.
+    """
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def iniciar_db():
+    """!
+    @brief Crea la tabla de alumnos y carga los datos iniciales si está vacía.
+    """
+    db = sqlite3.connect(DB_PATH)
+    db.execute("CREATE TABLE IF NOT EXISTS alumnos (id INTEGER PRIMARY KEY, nombre TEXT, carrera TEXT, promedio REAL)")
+    if db.execute("SELECT COUNT(*) FROM alumnos").fetchone()[0] == 0:
+        db.executemany("INSERT INTO alumnos VALUES (?, ?, ?, ?)", ALUMNOS_INICIALES)
+    db.commit()
+    db.close()
+
+
+@app.before_request
+def antes_de_la_peticion():
+    """!
+    @brief Marca el inicio de la petición y cuenta los parámetros con patrones de ataque.
+    """
+    g.inicio = time.perf_counter()
+    valores = list(request.args.values()) + list(request.form.values())
+    for tipo, patron in PATRONES_ATAQUE.items():
+        if any(patron.search(v) for v in valores):
+            SOSPECHOSAS.labels(tipo=tipo).inc()
+            app.logger.warning("Petición sospechosa (%s) desde %s a %s", tipo, request.remote_addr, request.path)
+
+
+@app.after_request
+def despues_de_la_peticion(respuesta):
+    """!
+    @brief Registra la métrica de cada petición atendida.
+    @param respuesta Respuesta que Flask enviará al cliente.
+    @return La misma respuesta.
+    """
+    endpoint = request.url_rule.rule if request.url_rule else "desconocido"
+    if endpoint != "/metrics":
+        HTTP_PETICIONES.labels(request.method, endpoint, str(respuesta.status_code)).inc()
+        HTTP_LATENCIA.labels(endpoint).observe(time.perf_counter() - g.get("inicio", time.perf_counter()))
+    respuesta.headers["X-Content-Type-Options"] = "nosniff"
+    respuesta.headers["X-Frame-Options"] = "DENY"
+    respuesta.headers["Referrer-Policy"] = "no-referrer"
+    respuesta.headers["Content-Security-Policy"] = (
+        "default-src 'self'; object-src 'none'; frame-ancestors 'none'; "
+        "base-uri 'self'; form-action 'self'"
+    )
+    respuesta.headers["Cache-Control"] = "no-store"
+    return respuesta
+
+
+@app.route("/")
+def portada():
+    """!
+    @brief Portada HTML con enlaces y formularios del sistema.
+    @return Página HTML.
+    """
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_hex(32)
+    return render_template_string(
+        PORTADA, version=VERSION, csrf_token=session["csrf_token"]
+    )
+
+
+@app.route("/hello")
+def hello():
+    """!
+    @brief Saluda al usuario cuyo nombre llega en el parámetro de URL «name».
+    @return Página HTML con el saludo.
+    """
+    name = request.args.get("name", "visitante")
+    return render_template_string("<h1>Hola, {{ name }}!</h1>", name=name)
+
+
+@app.route("/health")
+def health():
+    """!
+    @brief Estado de la aplicación (lo usan el despliegue y el monitoreo).
+    @return JSON {"estado": "ok"}.
+    """
+    return jsonify({"estado": "ok"})
+
+
+@app.route("/version")
+def version():
+    """!
+    @brief Versión desplegada, para la trazabilidad.
+    @return JSON con el nombre y la versión de la aplicación.
+    """
+    return jsonify({"aplicacion": "Sistema Alumnos", "version": VERSION})
+
+
+@app.route("/alumnos")
+def listar_alumnos():
+    """!
+    @brief Lista todos los alumnos.
+    @return JSON con la lista de alumnos.
+    """
+    filas = conectar().execute("SELECT * FROM alumnos ORDER BY id").fetchall()
+    return jsonify([dict(f) for f in filas])
+
+
+@app.route("/alumnos/<int:alumno_id>")
+def obtener_alumno(alumno_id):
+    """!
+    @brief Obtiene un alumno por su identificador.
+    @param alumno_id Identificador numérico del alumno.
+    @return JSON con el alumno, o error 404 si no existe.
+    """
+    fila = conectar().execute("SELECT * FROM alumnos WHERE id = ?", (alumno_id,)).fetchone()
+    if fila is None:
+        return jsonify({"error": "Alumno no encontrado"}), 404
+    return jsonify(dict(fila))
+
+
+@app.route("/alumnos/buscar")
+def buscar_alumnos():
+    """!
+    @brief Busca alumnos cuyo nombre contenga el texto del parámetro «nombre».
+    @return JSON con los alumnos encontrados.
+    """
+    nombre = request.args.get("nombre", "")
+    consulta = "SELECT * FROM alumnos WHERE nombre LIKE ?"
+    try:
+        filas = conectar().execute(consulta, (f"%{nombre}%",)).fetchall()
+    except sqlite3.Error:
+        app.logger.exception("Error al buscar alumnos")
+        return jsonify({"error": "Error interno del servidor"}), 500
+    return jsonify([dict(f) for f in filas])
+
+
+def permitir_intento(ip):
+    """!
+    @brief Reserva un intento de login dentro de la ventana por IP.
+    @param ip Dirección de origen de la petición.
+    @return True si el intento se permite.
+    """
+    with LOGIN_LOCK:
+        ahora = time.monotonic()
+        for origen, intentos in list(INTENTOS_LOGIN.items()):
+            while intentos and ahora - intentos[0] >= VENTANA_SEGUNDOS:
+                intentos.popleft()
+            if not intentos:
+                del INTENTOS_LOGIN[origen]
+
+        if ip not in INTENTOS_LOGIN and len(INTENTOS_LOGIN) >= MAX_IPS:
+            return False
+        intentos = INTENTOS_LOGIN.setdefault(ip, deque())
+        if len(intentos) >= MAX_INTENTOS:
+            return False
+        intentos.append(ahora)
+        return True
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    """!
+    @brief Valida las credenciales del administrador enviadas por formulario.
+    @return JSON con el resultado; 401 si las credenciales no son válidas.
+    """
+    token_enviado = request.form.get("csrf_token", "")
+    token_sesion = session.get("csrf_token", "")
+    if not token_sesion or not secrets.compare_digest(
+        token_enviado.encode("utf-8"), token_sesion.encode("utf-8")
+    ):
+        app.logger.warning("Token CSRF inválido desde %s", request.remote_addr)
+        return jsonify({"error": "Token CSRF inválido"}), 403
+
+    ip = request.remote_addr or "desconocida"
+    if not permitir_intento(ip):
+        app.logger.warning("Login limitado desde %s", ip)
+        respuesta = jsonify({"error": "Demasiados intentos. Intente más tarde."})
+        respuesta.headers["Retry-After"] = str(VENTANA_SEGUNDOS)
+        return respuesta, 429
+
+    usuario = request.form.get("usuario", "")
+    clave = request.form.get("clave", "")
+    clave_valida = check_password_hash(ADMIN_CLAVE_HASH, clave)
+    if usuario == ADMIN_USUARIO and clave_valida:
+        with LOGIN_LOCK:
+            INTENTOS_LOGIN.pop(ip, None)
+        session.pop("csrf_token", None)
+        LOGIN_EXITOSOS.inc()
+        return jsonify({"mensaje": "Bienvenido, administrador"})
+
+    LOGIN_FALLIDOS.inc()
+    app.logger.warning("Login fallido desde %s", ip)
+    return jsonify({"error": "Credenciales inválidas"}), 401
+
+
+@app.route("/metrics")
+def metrics():
+    """!
+    @brief Métricas en formato Prometheus.
+    @return Texto con las métricas.
+    """
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+
+iniciar_db()
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=False)
